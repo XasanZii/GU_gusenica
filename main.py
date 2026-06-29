@@ -1,12 +1,14 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
-from tkinter import font as tkfont
+from tkinter import filedialog
 from tkinter import ttk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 import os
 import sys
-from pathlib import Path
+import json
+import random
+import string
 import threading
+import math
 
 try:
     import cv2
@@ -19,126 +21,603 @@ except ImportError:
 
 
 def resource_path(relative_path):
-    """Получает правильный путь к файлам и в EXE, и в обычном Python"""
+    """Получает правильный путь к встроенным файлам (для EXE и для разработки)."""
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
 
+def app_dir():
+    """Возвращает директорию, где находится исполняемый файл (или .py)."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.abspath(".")
+
+
+def load_settings():
+    """Загружает настройки из settings.json рядом с exe/py."""
+    path = os.path.join(app_dir(), "settings.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_settings(data):
+    """Сохраняет настройки в settings.json рядом с exe/py."""
+    path = os.path.join(app_dir(), "settings.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except:
+        pass
+
+
 class NotificationPopup:
-    """Красивое всплывающее уведомление"""
+    """Всплывающее уведомление — просто одноцветный прямоугольник без рамок.
+    
+    Плавно выезжает справа, задерживается, плавно исчезает.
+    """
     
     def __init__(self, root, message, popup_type="info", duration=3000):
         self.root = root
-        self.message = message
-        self.popup_type = popup_type
-        self.duration = duration
-        
-        self.popup = tk.Toplevel(root)
-        self.popup.wm_overrideredirect(True)
-        self.popup.attributes('-topmost', True)
-        self.popup.attributes('-alpha', 0.95)
-        
         colors = {
             "success": ("#4CAF50", "#FFFFFF"),
             "error": ("#F44336", "#FFFFFF"),
             "warning": ("#FF9800", "#FFFFFF"),
-            "info": ("#2196F3", "#FFFFFF")
+            "info": ("#4A90D9", "#FFFFFF")
         }
-        
         bg_color, text_color = colors.get(popup_type, colors["info"])
         
-        frame = tk.Frame(self.popup, bg=bg_color)
-        frame.pack(padx=15, pady=10)
+        self.popup = tk.Toplevel(root)
+        self.popup.wm_overrideredirect(True)
+        self.popup.attributes('-topmost', True)
         
-        label = tk.Label(
-            frame,
-            text=message,
-            bg=bg_color,
-            fg=text_color,
-            font=("Segoe UI", 10),
-            padx=15,
-            pady=10
-        )
-        label.pack()
+        frame = tk.Frame(self.popup, bg=bg_color)
+        frame.pack()
+        
+        tk.Label(frame, text=message, bg=bg_color, fg=text_color,
+                 font=("Segoe UI", 10), padx=20, pady=12).pack()
         
         self.popup.update_idletasks()
-        width = self.popup.winfo_width()
-        height = self.popup.winfo_height()
-        x = root.winfo_x() + root.winfo_width() - width - 20
-        y = root.winfo_y() + 20
+        self._w = self.popup.winfo_width()
+        self._h = self.popup.winfo_height()
         
-        self.popup.geometry(f"+{x}+{y}")
-        self.popup.after(duration, self.close)
+        self._start_x = root.winfo_x() + root.winfo_width()
+        self._start_y = root.winfo_y() + 20
+        self.popup.geometry(f"+{self._start_x}+{self._start_y}")
+        
+        self._slide_in(duration)
     
-    def close(self):
+    def _slide_in(self, duration):
+        target_x = self._start_x - self._w - 10
+        self._slide_step(0, 15, target_x, duration)
+    
+    def _slide_step(self, step, total, target_x, duration):
+        if step > total:
+            self.popup.after(duration, self._slide_out)
+            return
+        t = step / total
+        ease = 1 - (1 - t) ** 3
+        x = self._start_x - (self._start_x - target_x) * ease
+        self.popup.geometry(f"+{int(x)}+{self._start_y}")
+        self.popup.attributes('-alpha', ease * 0.95)
+        self.popup.after(16, lambda: self._slide_step(step + 1, total, target_x, duration))
+    
+    def _slide_out(self):
+        self.popup.attributes('-alpha', 1)
+        self._slide_out_step(0, 10)
+    
+    def _slide_out_step(self, step, total):
+        if step > total:
+            self._close()
+            return
+        t = step / total
+        self.popup.attributes('-alpha', 1 - t)
+        self.popup.after(20, lambda: self._slide_out_step(step + 1, total))
+    
+    def _close(self):
         try:
             self.popup.destroy()
         except:
             pass
 
 
-class ImageConverter:
-    """Основной класс приложения"""
+# Shared helpers for 3D drawing
+def _arc_pts(cx1, cy1, cx2, cy2, start_angle, extent, steps=10):
+    cx = (cx1 + cx2) / 2
+    cy = (cy1 + cy2) / 2
+    rx = (cx2 - cx1) / 2
+    ry = (cy2 - cy1) / 2
+    pts = []
+    for i in range(steps + 1):
+        a = math.radians(start_angle + extent * i / steps)
+        pts.append(cx + rx * math.cos(a))
+        pts.append(cy + ry * math.sin(a))
+    return pts
+
+def _draw_rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
+    pts = []
+    pts.extend(_arc_pts(x2 - r, y1, x2, y1 + r, 0, 90))
+    pts.extend([x2, y1 + r, x2, y2 - r])
+    pts.extend(_arc_pts(x2 - r, y2 - r, x2, y2, 90, 90))
+    pts.extend([x2 - r, y2, x1 + r, y2])
+    pts.extend(_arc_pts(x1, y2 - r, x1 + r, y2, 180, 90))
+    pts.extend([x1, y2 - r, x1, y1 + r])
+    pts.extend(_arc_pts(x1, y1, x1 + r, y1 + r, 270, 90))
+    pts.extend([x1 + r, y1, x2 - r, y1])
+    return canvas.create_polygon(pts, smooth=True, **kw)
+
+def _lerp_color(c1, c2, t):
+    if c1 == c2 or not c1 or not c2:
+        return c1 if t < 0.5 else c2
+    try:
+        t = max(0.0, min(1.0, t))
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        return f"#{int(r1 + (r2 - r1) * t):02x}{int(g1 + (g2 - g1) * t):02x}{int(b1 + (b2 - b1) * t):02x}"
+    except Exception:
+        return c1 if t < 0.5 else c2
+
+def _ease_out_back(t):
+    c1 = 1.70158
+    c3 = c1 + 1
+    return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+
+class _3DButton(tk.Canvas):
+    """Голубая 3D-кнопка с эффектом объёма."""
     
+    _ANIM_DURATION = 200
+    _FRAME_INTERVAL = 16
+    
+    N_TOP = "#5B9EF4"
+    N_FACE = "#3A8BED"
+    N_BOTTOM = "#1A5BBF"
+    N_SHADOW = "#0F3D7A"
+    N_BORDER = "#1A4D8A"
+    
+    H_TOP = "#7BB5FF"
+    H_FACE = "#5B9EF4"
+    H_BOTTOM = "#2B7DE9"
+    H_SHADOW = "#1A5BBF"
+    H_BORDER = "#2B5FA8"
+    
+    P_TOP = "#1A5BBF"
+    P_FACE = "#1A5BBF"
+    P_BOTTOM = "#0F3D7A"
+    P_SHADOW = "#0A2A55"
+    P_BORDER = "#0F2A55"
+    
+    TEXT_COLOR = "#FFFFFF"
+    
+    def __init__(self, parent, text="", command=None, width=220, height=50,
+                 border_radius=8, font=("Segoe UI", 11, "bold")):
+        self._text = text.upper()
+        self._command = command
+        self._base_w = width
+        self._h = height
+        self._r = border_radius
+        self._font = font
+        
+        pad = 4
+        super().__init__(parent, highlightthickness=0, bd=0,
+                         bg=parent["bg"], width=width + pad * 2, height=height + pad * 2)
+        
+        self._cur_top = self.N_TOP
+        self._cur_face = self.N_FACE
+        self._cur_bottom = self.N_BOTTOM
+        self._cur_shadow = self.N_SHADOW
+        self._cur_border = self.N_BORDER
+        self._cur_offset = 0
+        
+        self._hovered = False
+        self._pressed = False
+        self._anim_id = None
+        
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        
+        self._redraw()
+    
+    def _redraw(self):
+        self.delete("all")
+        pad = 4
+        cw = int(self._base_w + pad * 2)
+        ch = int(self._h + pad * 2)
+        if cw < 4 or ch < 4:
+            return
+        
+        offset = int(self._cur_offset)
+        bx1, by1 = pad, pad + offset
+        bx2, by2 = cw - pad, ch - pad + offset
+        bw, bh = bx2 - bx1, by2 - by1
+        
+        _draw_rounded_rect(self, 0, 0, cw, ch, self._r, fill=self._cur_shadow, outline="", width=0)
+        _draw_rounded_rect(self, bx1 + 2, by1 + 2, bx2 + 2, by2 + 2, self._r,
+                          fill=self._cur_shadow, outline="", width=0)
+        _draw_rounded_rect(self, bx1, by1 + 2, bx2, by2 + 2, self._r,
+                          fill=self._cur_bottom, outline="", width=0)
+        _draw_rounded_rect(self, bx1 - 2, by1, bx2 - 2, by2, self._r,
+                          fill=self._cur_bottom, outline="", width=0)
+        _draw_rounded_rect(self, bx1, by1, bx2, by2, self._r,
+                          fill=self._cur_face, outline=self._cur_border, width=1)
+        _draw_rounded_rect(self, bx1 + 2, by1 + 1, bx2 - 2, by1 + int(bh * 0.4), self._r,
+                          fill=self._cur_top, outline="", width=0)
+        self.create_text(cw // 2, (by1 + by2) // 2 - 1, text=self._text,
+                         fill=self.TEXT_COLOR, font=self._font, anchor="center")
+    
+    def _cancel_anim(self):
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+            self._anim_id = None
+    
+    def _on_enter(self, event):
+        self._cancel_anim()
+        self._hovered = True
+        self._start_anim(True)
+    
+    def _on_leave(self, event):
+        self._cancel_anim()
+        self._hovered = False
+        self._pressed = False
+        self._start_anim(False)
+    
+    def _on_press(self, event):
+        self._cancel_anim()
+        self._pressed = True
+        self._cur_top = self.P_TOP
+        self._cur_face = self.P_FACE
+        self._cur_bottom = self.P_BOTTOM
+        self._cur_shadow = self.P_SHADOW
+        self._cur_border = self.P_BORDER
+        self._cur_offset = 2
+        self._redraw()
+    
+    def _on_release(self, event):
+        self._pressed = False
+        if self._command:
+            self._command()
+        if self._hovered:
+            self._start_anim(True)
+        else:
+            self._start_anim(False)
+    
+    def _start_anim(self, forward):
+        start = dict(top=self._cur_top, face=self._cur_face,
+                     bottom=self._cur_bottom, shadow=self._cur_shadow,
+                     border=self._cur_border, offset=self._cur_offset)
+        
+        if forward:
+            target = dict(top=self.H_TOP, face=self.H_FACE,
+                          bottom=self.H_BOTTOM, shadow=self.H_SHADOW,
+                          border=self.H_BORDER, offset=-1)
+        else:
+            target = dict(top=self.N_TOP, face=self.N_FACE,
+                          bottom=self.N_BOTTOM, shadow=self.N_SHADOW,
+                          border=self.N_BORDER, offset=0)
+        
+        self._anim_frame = 0
+        self._anim_total = self._ANIM_DURATION // self._FRAME_INTERVAL
+        self._anim_start = start
+        self._anim_target = target
+        self._anim_step()
+    
+    def _anim_step(self):
+        self._anim_frame += 1
+        t = min(self._anim_frame / self._anim_total, 1.0)
+        e = _ease_out_back(t)
+        s, tg = self._anim_start, self._anim_target
+        
+        self._cur_top = _lerp_color(s['top'], tg['top'], e)
+        self._cur_face = _lerp_color(s['face'], tg['face'], e)
+        self._cur_bottom = _lerp_color(s['bottom'], tg['bottom'], e)
+        self._cur_shadow = _lerp_color(s['shadow'], tg['shadow'], e)
+        self._cur_border = _lerp_color(s['border'], tg['border'], e)
+        self._cur_offset = s['offset'] + (tg['offset'] - s['offset']) * e
+        
+        self._redraw()
+        
+        if t >= 1.0:
+            self._anim_id = None
+        else:
+            self._anim_id = self.after(self._FRAME_INTERVAL, self._anim_step)
+
+
+class _3DDropdown(tk.Canvas):
+    """Выпадающий список в 3D-стиле."""
+    
+    _ANIM_DURATION = 200
+    _FRAME_INTERVAL = 16
+    
+    N_TOP = "#5B9EF4"
+    N_FACE = "#3A8BED"
+    N_BOTTOM = "#1A5BBF"
+    N_SHADOW = "#0F3D7A"
+    N_BORDER = "#1A4D8A"
+    
+    H_TOP = "#7BB5FF"
+    H_FACE = "#5B9EF4"
+    H_BOTTOM = "#2B7DE9"
+    H_SHADOW = "#1A5BBF"
+    H_BORDER = "#2B5FA8"
+    
+    TEXT_COLOR = "#FFFFFF"
+    
+    MENU_BORDER = "#1A5BBF"
+    MENU_BG = "#F5F9FF"
+    MENU_ITEM_BG = "#FFFFFF"
+    MENU_ITEM_HOVER = "#D6E8FF"
+    MENU_ITEM_SELECTED = "#B3D4FF"
+    MENU_TEXT = "#1A2B4A"
+    MENU_TEXT_HOVER = "#0D1B33"
+    MENU_SEPARATOR = "#C8D8E8"
+    
+    def __init__(self, parent, values=None, default=None, on_change=None,
+                 width=200, height=48, font=("Segoe UI", 11, "bold"), command=None):
+        self._values = values or []
+        self._on_change = on_change  # callback for format changes
+        self._selected = default if default and default in self._values else (values[0] if values else "")
+        self._font = font
+        self._command = command
+        self._base_w = width
+        self._h = height
+        self._menu_open = False
+        self._menu_window = None
+        
+        pad = 4
+        super().__init__(parent, highlightthickness=0, bd=0,
+                         bg=parent["bg"], width=width + pad * 2, height=height + pad * 2)
+        
+        self._cur_top = self.N_TOP
+        self._cur_face = self.N_FACE
+        self._cur_bottom = self.N_BOTTOM
+        self._cur_shadow = self.N_SHADOW
+        self._cur_border = self.N_BORDER
+        self._cur_offset = 0
+        
+        self._hovered = False
+        self._anim_id = None
+        
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+        
+        self._redraw()
+    
+    def get(self):
+        return self._selected
+    
+    def set_value(self, value):
+        """Установить значение и перерисовать."""
+        if value in self._values:
+            self._selected = value
+            self._redraw()
+    
+    def current(self, index):
+        if 0 <= index < len(self._values):
+            self._selected = self._values[index]
+            self._redraw()
+    
+    def _redraw(self):
+        self.delete("all")
+        pad = 4
+        cw = int(self._base_w + pad * 2)
+        ch = int(self._h + pad * 2)
+        if cw < 4 or ch < 4:
+            return
+        
+        offset = int(self._cur_offset)
+        bx1, by1 = pad, pad + offset
+        bx2, by2 = cw - pad, ch - pad + offset
+        bh = by2 - by1
+        
+        _draw_rounded_rect(self, 0, 0, cw, ch, 8, fill=self._cur_shadow, outline="", width=0)
+        _draw_rounded_rect(self, bx1 + 2, by1 + 2, bx2 + 2, by2 + 2, 8,
+                          fill=self._cur_shadow, outline="", width=0)
+        _draw_rounded_rect(self, bx1, by1 + 2, bx2, by2 + 2, 8,
+                          fill=self._cur_bottom, outline="", width=0)
+        _draw_rounded_rect(self, bx1 - 2, by1, bx2 - 2, by2, 8,
+                          fill=self._cur_bottom, outline="", width=0)
+        _draw_rounded_rect(self, bx1, by1, bx2, by2, 8,
+                          fill=self._cur_face, outline=self._cur_border, width=1)
+        _draw_rounded_rect(self, bx1 + 2, by1 + 1, bx2 - 2, by1 + int(bh * 0.4), 8,
+                          fill=self._cur_top, outline="", width=0)
+        
+        cy = (by1 + by2) // 2 - 1
+        self.create_text(16, cy, text=self._selected or "Выберите формат",
+                         fill=self.TEXT_COLOR, font=self._font, anchor="w")
+        
+        ax = cw - 20
+        s = 6
+        self.create_polygon([ax - s, cy - s // 2, ax + s, cy - s // 2, ax, cy + s // 2],
+                           fill=self.TEXT_COLOR, outline="")
+    
+    def _cancel_anim(self):
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+            self._anim_id = None
+    
+    def _on_enter(self, event):
+        if not self._menu_open:
+            self._cancel_anim()
+            self._hovered = True
+            self._start_anim(True)
+    
+    def _on_leave(self, event):
+        if not self._menu_open:
+            self._cancel_anim()
+            self._hovered = False
+            self._start_anim(False)
+    
+    def _on_click(self, event):
+        if self._menu_open:
+            self._close_menu()
+        else:
+            self._open_menu()
+    
+    def _open_menu(self):
+        if not self._values:
+            return
+        
+        self._menu_open = True
+        self.update_idletasks()
+        x = self.winfo_rootx() + 2
+        y = self.winfo_rooty() - (min(len(self._values), 6) * 40 + 4) - 4
+        
+        self._menu_window = tk.Toplevel(self)
+        self._menu_window.wm_overrideredirect(True)
+        self._menu_window.attributes('-topmost', True)
+        self._menu_window.configure(bg=self.MENU_BORDER)
+        
+        menu_width = self._base_w + 8
+        item_height = 40
+        visible_count = min(len(self._values), 6)
+        self._menu_window.geometry(f"{menu_width}x{visible_count * item_height + 4}+{x}+{y}")
+        
+        inner = tk.Frame(self._menu_window, bg=self.MENU_BG,
+                         highlightbackground=self.MENU_BORDER, highlightthickness=1,
+                         relief="raised", bd=2)
+        inner.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        
+        for i, value in enumerate(self._values):
+            is_sel = value == self._selected
+            frame = tk.Frame(inner, bg=self.MENU_BG, cursor="hand2", height=item_height)
+            frame.pack(fill=tk.X)
+            frame.pack_propagate(False)
+            
+            lbl = tk.Label(frame,
+                text=f"  {'✓  ' if is_sel else '   '}{value}",
+                bg=self.MENU_ITEM_SELECTED if is_sel else self.MENU_ITEM_BG,
+                fg=self.MENU_TEXT,
+                font=("Segoe UI", 11, "bold" if is_sel else "normal"),
+                anchor="w", padx=12, pady=8)
+            lbl.pack(fill=tk.BOTH, expand=True)
+            
+            if i < len(self._values) - 1:
+                tk.Frame(frame, bg=self.MENU_SEPARATOR, height=1).pack(fill=tk.X)
+            
+            def bind_item(idx, label):
+                def on_enter(e):
+                    if self._values[idx] != self._selected:
+                        label.configure(bg=self.MENU_ITEM_HOVER, fg=self.MENU_TEXT_HOVER)
+                def on_leave(e):
+                    if self._values[idx] != self._selected:
+                        label.configure(bg=self.MENU_ITEM_BG, fg=self.MENU_TEXT)
+                def on_click(e):
+                    old_val = self._selected
+                    self._selected = self._values[idx]
+                    # Если формат изменился — сохраняем
+                    if old_val != self._selected and self._on_change:
+                        self._on_change(self._selected)
+                    if self._command:
+                        self._command()
+                    self._redraw()
+                    self._close_menu()
+                label.bind("<Enter>", on_enter)
+                label.bind("<Leave>", on_leave)
+                label.bind("<Button-1>", on_click)
+                frame.bind("<Button-1>", on_click)
+            
+            bind_item(i, lbl)
+        
+        self._menu_window.bind("<FocusOut>", lambda e: self._close_menu())
+        self._menu_window.update()
+    
+    def _close_menu(self):
+        self._menu_open = False
+        if self._menu_window:
+            try:
+                self._menu_window.destroy()
+            except:
+                pass
+            self._menu_window = None
+        if not self._hovered:
+            self._start_anim(False)
+    
+    def _start_anim(self, forward):
+        start = dict(top=self._cur_top, face=self._cur_face,
+                     bottom=self._cur_bottom, shadow=self._cur_shadow,
+                     border=self._cur_border, offset=self._cur_offset)
+        
+        if forward:
+            target = dict(top=self.H_TOP, face=self.H_FACE,
+                          bottom=self.H_BOTTOM, shadow=self.H_SHADOW,
+                          border=self.H_BORDER, offset=-1)
+        else:
+            target = dict(top=self.N_TOP, face=self.N_FACE,
+                          bottom=self.N_BOTTOM, shadow=self.N_SHADOW,
+                          border=self.N_BORDER, offset=0)
+        
+        self._anim_frame = 0
+        self._anim_total = self._ANIM_DURATION // self._FRAME_INTERVAL
+        self._anim_start = start
+        self._anim_target = target
+        self._anim_step()
+    
+    def _anim_step(self):
+        self._anim_frame += 1
+        t = min(self._anim_frame / self._anim_total, 1.0)
+        e = _ease_out_back(t)
+        s, tg = self._anim_start, self._anim_target
+        
+        self._cur_top = _lerp_color(s['top'], tg['top'], e)
+        self._cur_face = _lerp_color(s['face'], tg['face'], e)
+        self._cur_bottom = _lerp_color(s['bottom'], tg['bottom'], e)
+        self._cur_shadow = _lerp_color(s['shadow'], tg['shadow'], e)
+        self._cur_border = _lerp_color(s['border'], tg['border'], e)
+        self._cur_offset = s['offset'] + (tg['offset'] - s['offset']) * e
+        
+        self._redraw()
+        
+        if t >= 1.0:
+            self._anim_id = None
+        else:
+            self._anim_id = self.after(self._FRAME_INTERVAL, self._anim_step)
+
+
+class ImageConverter:
     def __init__(self, root):
         self.root = root
-        self.root.title("Конвертер изображений")
-        self.root.geometry("1000x700")
+        self.root.title("Конвертер приложения Alpha 0.1.1")
+        self.root.geometry("1024x720")
         self.root.minsize(900, 600)
+        self.root.iconbitmap(default='')
         self.root.configure(bg="#1a1a1a")
         
-        # Переменные
-        self.current_image = None
-        self.current_image_path = None
+        self.image_paths = []
         self.quality = tk.IntVar(value=85)
         self.is_converting = False
+        self.supported_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif', '.tiff', '.tif', '.ico', '.nef', '.nrw', '.cr2'}
+        self.raw_extensions = {'.nef', '.nrw', '.cr2'}
         
-        # Инициализация переменных прогресса (ИСПРАВЛЕНО)
         self.progress_bar_id = None
-        
-        # Фоновое изображение
         self.background_image = None
         self.background_photo = None
         self.background_id = None
         
-        # Допустимые форматы
         self.formats = ["PNG", "JPG", "WEBP", "BMP", "TIFF", "ICO"]
         self.format_extensions = {
-            "PNG": ".png",
-            "JPG": ".jpg",
-            "WEBP": ".webp",
-            "BMP": ".bmp",
-            "TIFF": ".tiff",
-            "ICO": ".ico"
+            "PNG": ".png", "JPG": ".jpg", "WEBP": ".webp",
+            "BMP": ".bmp", "TIFF": ".tiff", "ICO": ".ico"
         }
+        
+        # Загружаем сохранённый формат
+        settings = load_settings()
+        self._saved_format = settings.get("format", "PNG")
         
         if rawpy is None:
             print("⚠️ Для работы с RAW форматами (NEF, CR2 и т.д.) установите: pip install rawpy")
         
         self.setup_ui()
     
+    def _on_format_change(self, new_format):
+        """Сохраняет выбранный формат в settings.json при каждом изменении."""
+        save_settings({"format": new_format})
+    
     def setup_ui(self):
-        """Создание интерфейса"""
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure(
-            'TCombobox',
-            fieldbackground='#6ec86e',
-            background='#6ec86e',
-            foreground='white',
-            arrowcolor='white',
-            relief='flat',
-            borderwidth=0,
-            padding=8,
-            font=('Segoe UI', 11, 'bold')
-        )
-        style.map('TCombobox',
-            fieldbackground=[('readonly', '#6ec86e'), ('active', '#5eb85e')],
-            background=[('active', '#5eb85e')],
-            foreground=[('readonly', 'white')]
-        )
-        
         self.canvas = tk.Canvas(self.root, bg="#1a1a1a", highlightthickness=0, bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
@@ -149,35 +628,21 @@ class ImageConverter:
         except:
             pass
         
-        # Элементы прогресса (ИСПРАВЛЕНО: теперь они создаются)
         self.progress_label = tk.Label(self.canvas, text="", bg="#1a1a1a", fg="white", font=("Segoe UI", 10))
         self.progress_bar = tk.Canvas(self.canvas, width=200, height=4, bg="#333333", highlightthickness=0)
         self.progress_label_window = None
         self.progress_bar_window = None
 
-        self.select_btn = tk.Button(
-            self.canvas, text="📂 Выбрать изображение", command=self.select_image,
-            bg="#4a9eff", fg="white", font=("Segoe UI", 12, "bold"),
-            padx=30, pady=15, relief=tk.FLAT, cursor="hand2", activebackground="#3a8eef"
-        )
-        
-        self.back_btn = tk.Button(
-            self.canvas, text="← Назад", command=self.combine_buttons,
-            bg="#ff6b6b", fg="white", font=("Segoe UI", 10, "bold"),
-            padx=15, pady=12, relief=tk.FLAT, cursor="hand2", activebackground="#ee5a52"
-        )
-        
-        self.format_combo = ttk.Combobox(
-            self.canvas, values=self.formats, state="readonly", width=16,
-            font=("Segoe UI", 11, "bold"), justify="center"
-        )
-        self.format_combo.current(0)
-        
-        self.convert_btn = tk.Button(
-            self.canvas, text="✓ Конвертировать", command=self.save_image, # ИСПРАВЛЕНО: вызываем save_image для потока
-            bg="#6ec86e", fg="white", font=("Segoe UI", 10, "bold"),
-            padx=15, pady=12, relief=tk.FLAT, cursor="hand2", activebackground="#5eb85e"
-        )
+        self.select_btn = _3DButton(self.canvas, text="ВЫБРАТЬ ПАПКУ", command=self.select_image,
+                                     width=240, height=52, font=("Segoe UI", 11, "bold"))
+        self.back_btn = _3DButton(self.canvas, text="НАЗАД", command=self.combine_buttons,
+                                   width=160, height=48, font=("Segoe UI", 10, "bold"))
+        # Передаём сохранённый формат и callback для автосохранения
+        self.format_combo = _3DDropdown(self.canvas, values=self.formats, default=self._saved_format,
+                                         on_change=self._on_format_change,
+                                         width=200, height=48, font=("Segoe UI", 11, "bold"))
+        self.convert_btn = _3DButton(self.canvas, text="КОНВЕРТИРОВАТЬ", command=self.save_image,
+                                      width=220, height=52, font=("Segoe UI", 11, "bold"))
         
         self.button_window_id = None
         self.back_window_id = None
@@ -188,13 +653,12 @@ class ImageConverter:
     def _update_background(self):
         if not self.background_image:
             return
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        if width < 1 or height < 1:
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        if w < 1 or h < 1:
             return
         
-        bg_resized = self.background_image.resize((width, height), Image.LANCZOS)
-        self.background_photo = ImageTk.PhotoImage(bg_resized)
+        bg = self.background_image.resize((w, h), Image.LANCZOS)
+        self.background_photo = ImageTk.PhotoImage(bg)
         
         if self.background_id is None:
             self.background_id = self.canvas.create_image(0, 0, anchor="nw", image=self.background_photo)
@@ -206,157 +670,113 @@ class ImageConverter:
         self._update_background()
         bottom_y = event.height - 60
         
-        # Перерисовка прогресс-бара при изменении размеров, если он активен
         if self.progress_label_window:
             self.canvas.coords(self.progress_label_window, event.width // 2, bottom_y - 60)
         if self.progress_bar_window:
             self.canvas.coords(self.progress_bar_window, event.width // 2, bottom_y - 45)
-
+        
         if self.buttons_expanded:
-            spacing = 280
-            if self.back_window_id: self.canvas.delete(self.back_window_id)
-            if self.format_window_id: self.canvas.delete(self.format_window_id)
-            if self.convert_window_id: self.canvas.delete(self.convert_window_id)
-            
-            self.back_window_id = self.canvas.create_window(event.width // 2 - spacing, bottom_y, window=self.back_btn)
+            sp = 280
+            for wid in [self.back_window_id, self.format_window_id, self.convert_window_id]:
+                if wid: self.canvas.delete(wid)
+            self.back_window_id = self.canvas.create_window(event.width // 2 - sp, bottom_y, window=self.back_btn)
             self.format_window_id = self.canvas.create_window(event.width // 2, bottom_y, window=self.format_combo)
-            self.convert_window_id = self.canvas.create_window(event.width // 2 + spacing, bottom_y, window=self.convert_btn)
+            self.convert_window_id = self.canvas.create_window(event.width // 2 + sp, bottom_y, window=self.convert_btn)
         else:
-            if self.back_window_id: self.canvas.delete(self.back_window_id)
-            if self.format_window_id: self.canvas.delete(self.format_window_id)
-            if self.convert_window_id: self.canvas.delete(self.convert_window_id)
-            
+            for wid in [self.back_window_id, self.format_window_id, self.convert_window_id]:
+                if wid: self.canvas.delete(wid)
             self.button_window_id = self.canvas.create_window(event.width // 2, bottom_y, window=self.select_btn)
     
     def select_image(self):
-        file_path = filedialog.askopenfilename(
-            title="Выберите изображение",
-            filetypes=[
-                ("Все изображения", "*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tiff *.ico *.nef *.nrw *.cr2"),
-                ("PNG", "*.png"), ("JPG", "*.jpg *.jpeg"), ("WebP", "*.webp"), ("BMP", "*.bmp"),
-                ("GIF", "*.gif"), ("TIFF", "*.tiff"), ("ICO", "*.ico"),
-                ("Nikon RAW (NEF)", "*.nef *.nrw"), ("Canon RAW (CR2)", "*.cr2"), ("Все файлы", "*.*")
-            ]
-        )
-        if file_path:
-            self._load_image(file_path)
-    
-    def _load_image(self, file_path):
-        try:
-            if not os.path.exists(file_path):
-                NotificationPopup(self.root, "Файл не найден", "error")
-                return
-            
-            file_ext = os.path.splitext(file_path)[1].lower()
-            
-            if file_ext in ['.nef', '.nrw', '.cr2'] and rawpy is not None:
-                try:
-                    raw = rawpy.imread(file_path)
-                    rgb_array = raw.postprocess()
-                    image = Image.fromarray(rgb_array)
-                except Exception as e:
-                    NotificationPopup(self.root, f"Ошибка обработки RAW: {str(e)}", "error")
-                    return
-            elif file_ext in ['.nef', '.nrw', '.cr2'] and rawpy is None:
-                NotificationPopup(self.root, "Установите rawpy для работы с RAW: pip install rawpy", "warning")
-                return
-            else:
-                image = Image.open(file_path)
-            
-            if hasattr(image, 'format'):
-                valid_formats = ['PNG', 'JPEG', 'WEBP', 'BMP', 'GIF', 'TIFF', 'ICO', 'RGB', 'RGBA']
-                if image.format and image.format not in valid_formats:
-                    NotificationPopup(self.root, "Неподдерживаемый формат изображения", "warning")
-                    return
-            
-            self.current_image = image
-            self.current_image_path = file_path
-            
-            if not self.buttons_expanded:
-                self.expand_buttons()
-            
-        except Exception as e:
-            NotificationPopup(self.root, f"Ошибка загрузки: {str(e)}", "error")
+        folder = filedialog.askdirectory(title="Выберите папку с изображениями")
+        if not folder:
+            return
+        
+        paths = []
+        for f in os.listdir(folder):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in self.supported_extensions:
+                paths.append(os.path.join(folder, f))
+        
+        if not paths:
+            NotificationPopup(self.root, "В выбранной папке не найдено изображений", "warning")
+            return
+        
+        self.image_paths = paths
+        NotificationPopup(self.root, f"Найдено {len(paths)} изображений. Выберите формат и нажмите Конвертировать",
+                         "info", duration=4000)
+        
+        if not self.buttons_expanded:
+            self.expand_buttons()
     
     def expand_buttons(self):
-        if self.buttons_expanded or not hasattr(self, 'canvas'):
+        if self.buttons_expanded:
             return
         self.buttons_expanded = True
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        bottom_y = height - 60
-        
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if self.button_window_id:
             self.canvas.delete(self.button_window_id)
-        
-        self.animate_buttons_expand(width // 2, bottom_y, 0, 25)
+        self._animate_expand(w // 2, h - 60, 0, 30)
     
-    def animate_buttons_expand(self, center_x, center_y, progress, max_steps):
-        if progress <= max_steps:
-            ratio = progress / max_steps
-            offset = (ratio * ratio) * 280
-            
-            if self.back_window_id: self.canvas.delete(self.back_window_id)
-            if self.format_window_id: self.canvas.delete(self.format_window_id)
-            if self.convert_window_id: self.canvas.delete(self.convert_window_id)
-            
-            self.back_window_id = self.canvas.create_window(center_x - offset, center_y, window=self.back_btn)
-            self.format_window_id = self.canvas.create_window(center_x, center_y, window=self.format_combo)
-            self.convert_window_id = self.canvas.create_window(center_x + offset, center_y, window=self.convert_btn)
-            
-            self.root.after(10, lambda: self.animate_buttons_expand(center_x, center_y, progress + 1, max_steps))
+    def _animate_expand(self, cx, cy, progress, max_steps):
+        if progress > max_steps:
+            return
+        t = progress / max_steps
+        ease_t = 1 + 1.70158 * (t - 1) ** 3 + 2.70158 * (t - 1) ** 2
+        offset = ease_t * 280
+        
+        for wid in [self.back_window_id, self.format_window_id, self.convert_window_id]:
+            if wid: self.canvas.delete(wid)
+        self.back_window_id = self.canvas.create_window(cx - offset, cy, window=self.back_btn)
+        self.format_window_id = self.canvas.create_window(cx, cy, window=self.format_combo)
+        self.convert_window_id = self.canvas.create_window(cx + offset, cy, window=self.convert_btn)
+        
+        self.root.after(10, lambda: self._animate_expand(cx, cy, progress + 1, max_steps))
     
     def combine_buttons(self):
         if not self.buttons_expanded:
             return
         self.buttons_expanded = False
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        bottom_y = height - 60
-        
-        self.animate_buttons_combine(width // 2, bottom_y, 0, 25)
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        self._animate_combine(w // 2, h - 60, 0, 30)
     
-    def animate_buttons_combine(self, center_x, center_y, progress, max_steps):
-        if progress <= max_steps:
-            ratio = 1 - (progress / max_steps)
-            offset = (ratio * ratio) * 280
-            
-            if self.back_window_id: self.canvas.delete(self.back_window_id)
-            if self.format_window_id: self.canvas.delete(self.format_window_id)
-            if self.convert_window_id: self.canvas.delete(self.convert_window_id)
-            
-            self.back_window_id = self.canvas.create_window(center_x - offset, center_y, window=self.back_btn)
-            self.format_window_id = self.canvas.create_window(center_x, center_y, window=self.format_combo)
-            self.convert_window_id = self.canvas.create_window(center_x + offset, center_y, window=self.convert_btn)
-            
-            self.root.after(10, lambda: self.animate_buttons_combine(center_x, center_y, progress + 1, max_steps))
-        else:
-            if self.back_window_id: self.canvas.delete(self.back_window_id)
-            if self.format_window_id: self.canvas.delete(self.format_window_id)
-            if self.convert_window_id: self.canvas.delete(self.convert_window_id)
-            
-            self.button_window_id = self.canvas.create_window(center_x, center_y, window=self.select_btn)
+    def _animate_combine(self, cx, cy, progress, max_steps):
+        if progress > max_steps:
+            for wid in [self.back_window_id, self.format_window_id, self.convert_window_id]:
+                if wid: self.canvas.delete(wid)
+            self.button_window_id = self.canvas.create_window(cx, cy, window=self.select_btn)
+            return
+        
+        t = progress / max_steps
+        ease_t = 1 - (1 - t) ** 3
+        offset = (1 - ease_t) * 280
+        
+        for wid in [self.back_window_id, self.format_window_id, self.convert_window_id]:
+            if wid: self.canvas.delete(wid)
+        self.back_window_id = self.canvas.create_window(cx - offset, cy, window=self.back_btn)
+        self.format_window_id = self.canvas.create_window(cx, cy, window=self.format_combo)
+        self.convert_window_id = self.canvas.create_window(cx + offset, cy, window=self.convert_btn)
+        
+        self.root.after(10, lambda: self._animate_combine(cx, cy, progress + 1, max_steps))
     
     def _show_progress(self, text):
-        """Показать индикатор выполнения (ИСПРАВЛЕНО)"""
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        bottom_y = height - 60
-        
-        self.progress_label.configure(text=text, bg="#1a1a1a")
-        
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        by = h - 60
+        self.progress_label.configure(text=text)
         if not self.progress_label_window:
-            self.progress_label_window = self.canvas.create_window(width // 2, bottom_y - 60, window=self.progress_label)
+            self.progress_label_window = self.canvas.create_window(w // 2, by - 60, window=self.progress_label)
         if not self.progress_bar_window:
-            self.progress_bar_window = self.canvas.create_window(width // 2, bottom_y - 45, window=self.progress_bar)
-            
+            self.progress_bar_window = self.canvas.create_window(w // 2, by - 45, window=self.progress_bar)
         if self.progress_bar_id:
             self.progress_bar.delete(self.progress_bar_id)
-        
-        self.progress_bar_id = self.progress_bar.create_rectangle(0, 0, 100, 4, fill="#4a9eff", outline="")
+        self.progress_bar_id = self.progress_bar.create_rectangle(0, 0, 100, 4, fill="#3A8BED", outline="")
+    
+    def _update_progress_bar(self, width):
+        if self.progress_bar_id:
+            self.progress_bar.delete(self.progress_bar_id)
+        self.progress_bar_id = self.progress_bar.create_rectangle(0, 0, width, 4, fill="#3A8BED", outline="")
     
     def _hide_progress(self):
-        """Скрыть индикатор выполнения (ИСПРАВЛЕНО)"""
         self.progress_label.configure(text="")
         if self.progress_bar_id:
             self.progress_bar.delete(self.progress_bar_id)
@@ -368,72 +788,108 @@ class ImageConverter:
             self.canvas.delete(self.progress_bar_window)
             self.progress_bar_window = None
     
+    def _generate_random_name(self, length=8):
+        return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length))
+    
+    def _convert_single_image(self, path, output_dir, fmt):
+        ext = os.path.splitext(path)[1].lower()
+        
+        if ext in self.raw_extensions and rawpy is not None:
+            raw = rawpy.imread(path)
+            img = Image.fromarray(raw.postprocess())
+        elif ext in self.raw_extensions:
+            return None, "rawpy не установлен для RAW"
+        else:
+            img = Image.open(path)
+        
+        if fmt == "JPG":
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+        elif fmt == "ICO":
+            s = min(img.size)
+            img = img.crop((0, 0, s, s))
+        
+        kwargs = {}
+        if fmt in ("JPG", "WEBP"):
+            kwargs["quality"] = self.quality.get()
+        if fmt == "PNG":
+            kwargs["optimize"] = True
+        
+        save_fmt = "JPEG" if fmt == "JPG" else fmt
+        ext = self.format_extensions[fmt]
+        
+        while True:
+            name = self._generate_random_name()
+            out = os.path.join(output_dir, f"{name}{ext}")
+            if not os.path.exists(out):
+                break
+        
+        img.save(out, save_fmt, **kwargs)
+        return out, None
+    
     def save_image(self):
-        """Сохранение изображения"""
-        if not self.current_image:
-            NotificationPopup(self.root, "Изображение не загружено", "warning")
+        if not self.image_paths:
+            NotificationPopup(self.root, "Сначала выберите папку с изображениями", "warning")
             return
         
-        selected_format = self.format_combo.get()
-        extension = self.format_extensions[selected_format]
+        fmt = self.format_combo.get()
+        src = os.path.dirname(self.image_paths[0])
+        out_dir = os.path.join(os.path.dirname(src), f"{os.path.basename(src)}_converted")
         
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=extension,
-            filetypes=[(f"{selected_format} Image", f"*{extension}"), ("All Files", "*.*")]
-        )
-        
-        if not file_path:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            NotificationPopup(self.root, f"Не удалось создать папку: {str(e)}", "error")
             return
         
         self.is_converting = True
-        thread = threading.Thread(target=self._convert_and_save, args=(file_path, selected_format))
-        thread.daemon = True
-        thread.start()
+        t = threading.Thread(target=self._batch_convert, args=(out_dir, fmt))
+        t.daemon = True
+        t.start()
     
-    def _convert_and_save(self, file_path, format_str):
-        """Конвертация и сохранение изображения в потоке"""
+    def _batch_convert(self, out_dir, fmt):
+        errors = []
+        success = 0
+        total = len(self.image_paths)
+        
         try:
-            self.root.after(0, lambda: self._show_progress(f"Конвертация в {format_str}..."))
+            for i, path in enumerate(self.image_paths):
+                if not self.is_converting:
+                    break
+                
+                name = os.path.basename(path)
+                self.root.after(0, lambda t=f"[{i+1}/{total}] Конвертация {name} -> {fmt}": self._show_progress(t))
+                
+                _, err = self._convert_single_image(path, out_dir, fmt)
+                if err:
+                    errors.append(f"{name}: {err}")
+                else:
+                    success += 1
+                
+                self.root.after(0, lambda w=int(200 * (i + 1) / total): self._update_progress_bar(w))
             
-            image = self.current_image.copy()
-            
-            if format_str == "JPG":
-                if image.mode in ["RGBA", "LA"] or (image.mode == "P" and "transparency" in image.info):
-                    rgb_image = Image.new("RGB", image.size, (255, 255, 255))
-                    rgb_image.paste(image, mask=image.split()[-1])
-                    image = rgb_image
-                elif image.mode != "RGB":
-                    image = image.convert("RGB")
-            elif format_str == "ICO":
-                size = min(image.size)
-                image = image.crop((0, 0, size, size))
-            
-            save_kwargs = {}
-            if format_str in ["JPG", "WEBP"]:
-                save_kwargs["quality"] = self.quality.get()
-            if format_str == "PNG":
-                save_kwargs["optimize"] = True
-            
-            # Подмена имени формата для Pillow (Pillow ожидает JPEG вместо JPG)
-            save_format = "JPEG" if format_str == "JPG" else format_str
-            image.save(file_path, save_format, **save_kwargs)
-            
-            file_size = os.path.getsize(file_path) / 1024
-            
-            self.root.after(0, lambda: NotificationPopup(
-                self.root, f"Сохранено: {os.path.basename(file_path)} ({file_size:.1f} KB)", "success"
-            ))
-            self.root.after(100, self.show_gif_popup)
-            
+            if errors:
+                msg = "\n".join(errors[:5])
+                if len(errors) > 5:
+                    msg += f"\n... и ещё {len(errors) - 5} ошибок"
+                self.root.after(0, lambda: NotificationPopup(self.root,
+                    f"Готово! Успешно: {success}/{total}. Ошибок: {len(errors)}",
+                    "warning" if success > 0 else "error", duration=5000))
+            else:
+                self.root.after(0, lambda: NotificationPopup(self.root,
+                    f"✅ Все {success} изображений конвертированы в {fmt}!", "success", duration=5000))
+                self.root.after(100, self.show_gif_popup)
         except Exception as e:
-            error_message = str(e)
-            self.root.after(0, lambda: NotificationPopup(self.root, f"Ошибка сохранения: {error_message}", "error"))
+            self.root.after(0, lambda: NotificationPopup(self.root, f"Критическая ошибка: {str(e)}", "error"))
         finally:
             self.root.after(0, self._hide_progress)
             self.is_converting = False
     
     def show_gif_popup(self):
-        """Показать видео в центре окна после успешной конвертации"""
         if cv2 is None:
             NotificationPopup(self.root, "OpenCV не установлен. Установите: pip install opencv-python", "error")
             return
@@ -447,88 +903,74 @@ class ImageConverter:
             NotificationPopup(self.root, f"Ошибка загрузки видео: {str(e)}", "error")
             return
         
-        gif_window = tk.Toplevel(self.root)
-        gif_window.title("")
-        gif_window.attributes('-topmost', True)
-        gif_window.resizable(False, False)
-        gif_window.configure(bg="#1a1a1a")
-        gif_window.overrideredirect(True)
+        win = tk.Toplevel(self.root)
+        win.title("")
+        win.attributes('-topmost', True)
+        win.resizable(False, False)
+        win.configure(bg="#1a1a1a")
+        win.overrideredirect(True)
         
-        gif_size = 400
-        gif_window.geometry(f"{gif_size}x{gif_size}")
+        size = 400
+        win.geometry(f"{size}x{size}")
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - size) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - size) // 2
+        win.geometry(f"{size}x{size}+{x}+{y}")
         
-        gif_window.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (gif_size // 2)
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (gif_size // 2)
-        gif_window.geometry(f"{gif_size}x{gif_size}+{x}+{y}")
-        
-        canvas = tk.Canvas(gif_window, bg="#1a1a1a", highlightthickness=0, bd=0)
+        canvas = tk.Canvas(win, bg="#1a1a1a", highlightthickness=0, bd=0)
         canvas.pack(fill=tk.BOTH, expand=True)
         
-        self.video_frames = []
-        self.video_index = 0
+        frames = []
+        idx = 0
         
         try:
             fps = video.get(cv2.CAP_PROP_FPS)
-            frame_delay = max(int(1000 / fps) if fps > 0 else 33, 20)
+            delay = max(int(1000 / fps) if fps > 0 else 33, 20)
             
             while True:
                 ret, frame = video.read()
                 if not ret:
                     break
-                
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                height, width = frame_rgb.shape[:2]
-                aspect = width / height
-                new_height = gif_size - 20
-                new_width = int(new_height * aspect)
-                if new_width > gif_size - 20:
-                    new_width = gif_size - 20
-                    new_height = int(new_width / aspect)
-                
-                frame_resized = cv2.resize(frame_rgb, (new_width, new_height))
-                pil_frame = Image.fromarray(frame_resized)
-                photo = ImageTk.PhotoImage(pil_frame)
-                self.video_frames.append(photo)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                aspect = w / h
+                nh = size - 20
+                nw = int(nh * aspect)
+                if nw > size - 20:
+                    nw = size - 20
+                    nh = int(nw / aspect)
+                resized = cv2.resize(rgb, (nw, nh))
+                frames.append(ImageTk.PhotoImage(Image.fromarray(resized)))
             
             video.release()
-            
-            if not self.video_frames:
+            if not frames:
                 NotificationPopup(self.root, "Видео не содержит кадров", "error")
-                gif_window.destroy()
+                win.destroy()
                 return
         except Exception as e:
             NotificationPopup(self.root, f"Ошибка обработки видео: {str(e)}", "error")
-            gif_window.destroy()
+            win.destroy()
             return
         
-        video_photo_id = canvas.create_image(gif_size // 2, gif_size // 2, image=self.video_frames[0])
+        photo_id = canvas.create_image(size // 2, size // 2, image=frames[0])
         
-        def animate_video():
-            if gif_window.winfo_exists():
-                canvas.itemconfig(video_photo_id, image=self.video_frames[self.video_index])
-                self.video_index = (self.video_index + 1) % len(self.video_frames)
-                gif_window.after(frame_delay, animate_video)
+        def animate():
+            nonlocal idx
+            if win.winfo_exists():
+                canvas.itemconfig(photo_id, image=frames[idx])
+                idx = (idx + 1) % len(frames)
+                win.after(delay, animate)
         
-        animate_video()
-        
-        # ИСПРАВЛЕНО: Очищаем ссылки на кадры при закрытии, чтобы освободить ОЗУ
-        def on_close():
-            self.video_frames = []
-            if gif_window.winfo_exists():
-                gif_window.destroy()
-
-        gif_window.after(5000, on_close)
+        animate()
+        win.after(5000, lambda: [frames.clear(), win.destroy() if win.winfo_exists() else None])
     
     def run(self):
-        """Запуск приложения"""
         self.root.mainloop()
 
 
 def main():
     root = tk.Tk()
-    app = ImageConverter(root)
-    app.run()
+    ImageConverter(root).run()
 
 
 if __name__ == "__main__":
