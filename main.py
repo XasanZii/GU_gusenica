@@ -5,8 +5,6 @@ from PIL import Image, ImageTk
 import os
 import sys
 import json
-import random
-import string
 import threading
 import math
 
@@ -18,6 +16,15 @@ try:
     import rawpy
 except ImportError:
     rawpy = None
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pillow_heif = None
+try:
+    import vlc
+except ImportError:
+    vlc = None
 
 
 def resource_path(relative_path):
@@ -189,6 +196,12 @@ class _3DButton(tk.Canvas):
     P_SHADOW = "#0A2A55"
     P_BORDER = "#0F2A55"
     
+    D_TOP = "#808080"
+    D_FACE = "#707070"
+    D_BOTTOM = "#505050"
+    D_SHADOW = "#404040"
+    D_BORDER = "#505050"
+    
     TEXT_COLOR = "#FFFFFF"
     
     def __init__(self, parent, text="", command=None, width=220, height=50,
@@ -214,6 +227,7 @@ class _3DButton(tk.Canvas):
         self._hovered = False
         self._pressed = False
         self._anim_id = None
+        self._disabled = False
         
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
@@ -254,12 +268,35 @@ class _3DButton(tk.Canvas):
             self.after_cancel(self._anim_id)
             self._anim_id = None
     
+    def set_disabled(self, disabled):
+        """Переключает кнопку в серое (выключенное) состояние."""
+        self._disabled = disabled
+        if disabled:
+            self._cur_top = self.D_TOP
+            self._cur_face = self.D_FACE
+            self._cur_bottom = self.D_BOTTOM
+            self._cur_shadow = self.D_SHADOW
+            self._cur_border = self.D_BORDER
+            self._cur_offset = 0
+        else:
+            self._cur_top = self.N_TOP
+            self._cur_face = self.N_FACE
+            self._cur_bottom = self.N_BOTTOM
+            self._cur_shadow = self.N_SHADOW
+            self._cur_border = self.N_BORDER
+            self._cur_offset = 0
+        self._redraw()
+    
     def _on_enter(self, event):
+        if self._disabled:
+            return
         self._cancel_anim()
         self._hovered = True
         self._start_anim(True)
     
     def _on_leave(self, event):
+        if self._disabled:
+            return
         self._cancel_anim()
         self._hovered = False
         self._pressed = False
@@ -268,18 +305,22 @@ class _3DButton(tk.Canvas):
     def _on_press(self, event):
         self._cancel_anim()
         self._pressed = True
-        self._cur_top = self.P_TOP
-        self._cur_face = self.P_FACE
-        self._cur_bottom = self.P_BOTTOM
-        self._cur_shadow = self.P_SHADOW
-        self._cur_border = self.P_BORDER
-        self._cur_offset = 2
-        self._redraw()
+        if not self._disabled:
+            self._cur_top = self.P_TOP
+            self._cur_face = self.P_FACE
+            self._cur_bottom = self.P_BOTTOM
+            self._cur_shadow = self.P_SHADOW
+            self._cur_border = self.P_BORDER
+            self._cur_offset = 2
+            self._redraw()
     
     def _on_release(self, event):
         self._pressed = False
+        # Команда выполняется даже в сером состоянии (чтобы можно было включить музыку обратно)
         if self._command:
             self._command()
+        if self._disabled:
+            return
         if self._hovered:
             self._start_anim(True)
         else:
@@ -327,7 +368,7 @@ class _3DButton(tk.Canvas):
 
 
 class _3DDropdown(tk.Canvas):
-    """Выпадающий список в 3D-стиле."""
+    """Выпадающий список в 3D-стиле со скроллбаром."""
     
     _ANIM_DURATION = 200
     _FRAME_INTERVAL = 16
@@ -345,6 +386,10 @@ class _3DDropdown(tk.Canvas):
     H_BORDER = "#2B5FA8"
     
     TEXT_COLOR = "#FFFFFF"
+    
+    SCROLLBAR_COLOR = "#C0C8D4"
+    SCROLLBAR_HOVER = "#A0AAB8"
+    SCROLLBAR_BG = "#E8ECF0"
     
     MENU_BORDER = "#1A5BBF"
     MENU_BG = "#F5F9FF"
@@ -465,7 +510,15 @@ class _3DDropdown(tk.Canvas):
         self._menu_open = True
         self.update_idletasks()
         x = self.winfo_rootx() + 2
-        y = self.winfo_rooty() - (min(len(self._values), 6) * 40 + 4) - 4
+        
+        item_height = 40
+        total_height = len(self._values) * item_height
+        max_visible = 6
+        visible_count = min(len(self._values), max_visible)
+        menu_height = visible_count * item_height + 4
+        
+        # Меню открывается вверх
+        y = self.winfo_rooty() - menu_height - 4
         
         self._menu_window = tk.Toplevel(self)
         self._menu_window.wm_overrideredirect(True)
@@ -473,14 +526,42 @@ class _3DDropdown(tk.Canvas):
         self._menu_window.configure(bg=self.MENU_BORDER)
         
         menu_width = self._base_w + 8
-        item_height = 40
-        visible_count = min(len(self._values), 6)
-        self._menu_window.geometry(f"{menu_width}x{visible_count * item_height + 4}+{x}+{y}")
+        scrollbar_width = 12
         
-        inner = tk.Frame(self._menu_window, bg=self.MENU_BG,
-                         highlightbackground=self.MENU_BORDER, highlightthickness=1,
-                         relief="raised", bd=2)
-        inner.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        # Если элементов больше чем видно — добавляем скроллбар
+        needs_scroll = len(self._values) > max_visible
+        
+        if needs_scroll:
+            # Используем Canvas + Scrollbar для прокрутки
+            menu_canvas = tk.Canvas(self._menu_window, bg=self.MENU_BG,
+                                    highlightthickness=0, bd=0,
+                                    width=menu_width - scrollbar_width - 4,
+                                    height=menu_height - 4)
+            scrollbar = tk.Scrollbar(self._menu_window, orient="vertical",
+                                     command=menu_canvas.yview)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            menu_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2, pady=2)
+            
+            scrollable_frame = tk.Frame(menu_canvas, bg=self.MENU_BG)
+            scrollable_frame.bind("<Configure>",
+                                  lambda e: menu_canvas.configure(scrollregion=menu_canvas.bbox("all")))
+            
+            menu_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw",
+                                      width=menu_width - scrollbar_width - 8)
+            menu_canvas.configure(yscrollcommand=scrollbar.set)
+            
+            # Колесо мыши для прокрутки
+            def _on_mousewheel(event):
+                menu_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            menu_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            
+            inner = scrollable_frame
+        else:
+            self._menu_window.geometry(f"{menu_width}x{menu_height}+{x}+{y}")
+            inner = tk.Frame(self._menu_window, bg=self.MENU_BG,
+                             highlightbackground=self.MENU_BORDER, highlightthickness=1,
+                             relief="raised", bd=2)
+            inner.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
         for i, value in enumerate(self._values):
             is_sel = value == self._selected
@@ -523,12 +604,24 @@ class _3DDropdown(tk.Canvas):
             
             bind_item(i, lbl)
         
+        if needs_scroll:
+            menu_canvas.configure(width=menu_width - scrollbar_width - 4, height=menu_height - 4)
+            self._menu_window.geometry(f"{menu_width}x{menu_height}+{x}+{y}")
+            self._menu_window._scroll_canvas = menu_canvas
+            self._menu_window._mousewheel_binding = _on_mousewheel
+        
         self._menu_window.bind("<FocusOut>", lambda e: self._close_menu())
         self._menu_window.update()
     
     def _close_menu(self):
         self._menu_open = False
         if self._menu_window:
+            # Отвязываем колесо мыши, если было
+            if hasattr(self._menu_window, '_mousewheel_binding'):
+                try:
+                    self._menu_window.unbind_all("<MouseWheel>")
+                except:
+                    pass
             try:
                 self._menu_window.destroy()
             except:
@@ -590,18 +683,23 @@ class ImageConverter:
         self.image_paths = []
         self.quality = tk.IntVar(value=85)
         self.is_converting = False
-        self.supported_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif', '.tiff', '.tif', '.ico', '.nef', '.nrw', '.cr2'}
+        self.supported_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif', '.tiff', '.tif', '.ico', '.nef', '.nrw', '.cr2', '.heic', '.heif'}
         self.raw_extensions = {'.nef', '.nrw', '.cr2'}
+        self.heic_extensions = {'.heic', '.heif'}
         
         self.progress_bar_id = None
         self.background_image = None
         self.background_photo = None
         self.background_id = None
+        self.music_player = None
+        self.music_playing = False
+        self.music_btn = None
         
-        self.formats = ["PNG", "JPG", "WEBP", "BMP", "TIFF", "ICO"]
+        self.formats = ["PNG", "JPG", "WEBP", "BMP", "TIFF", "ICO", "HEIC"]
         self.format_extensions = {
             "PNG": ".png", "JPG": ".jpg", "WEBP": ".webp",
-            "BMP": ".bmp", "TIFF": ".tiff", "ICO": ".ico"
+            "BMP": ".bmp", "TIFF": ".tiff", "ICO": ".ico",
+            "HEIC": ".heic"
         }
         
         # Загружаем сохранённый формат
@@ -610,8 +708,13 @@ class ImageConverter:
         
         if rawpy is None:
             print("⚠️ Для работы с RAW форматами (NEF, CR2 и т.д.) установите: pip install rawpy")
+        if pillow_heif is None:
+            print("⚠️ Для работы с HEIC/HEIF форматами установите: pip install pillow-heif")
+        if vlc is None:
+            print("⚠️ Для работы с музыкой установите: pip install python-vlc")
         
         self.setup_ui()
+        self._init_music()
     
     def _on_format_change(self, new_format):
         """Сохраняет выбранный формат в settings.json при каждом изменении."""
@@ -628,10 +731,12 @@ class ImageConverter:
         except:
             pass
         
-        self.progress_label = tk.Label(self.canvas, text="", bg="#1a1a1a", fg="white", font=("Segoe UI", 10))
-        self.progress_bar = tk.Canvas(self.canvas, width=200, height=4, bg="#333333", highlightthickness=0)
-        self.progress_label_window = None
+        self.progress_label = tk.Label(self.canvas, text="", bg="#1a1a1a", fg="white", font=("Segoe UI", 11))
+        self.progress_bar = tk.Canvas(self.canvas, width=400, height=20, bg="#2A2A2A", highlightthickness=0)
         self.progress_bar_window = None
+        self.progress_label_window = None
+        self.progress_percent_label = tk.Label(self.canvas, text="", bg="#1a1a1a", fg="#CCCCCC", font=("Segoe UI", 9))
+        self.progress_percent_window = None
 
         self.select_btn = _3DButton(self.canvas, text="ВЫБРАТЬ ПАПКУ", command=self.select_image,
                                      width=240, height=52, font=("Segoe UI", 11, "bold"))
@@ -644,7 +749,12 @@ class ImageConverter:
         self.convert_btn = _3DButton(self.canvas, text="КОНВЕРТИРОВАТЬ", command=self.save_image,
                                       width=220, height=52, font=("Segoe UI", 11, "bold"))
         
+        # Кнопка музыки в левом верхнем углу
+        self.music_btn = _3DButton(self.canvas, text="♫ ВКЛ", command=self._toggle_music,
+                                    width=80, height=36, font=("Segoe UI", 9, "bold"))
+        
         self.button_window_id = None
+        self.music_window_id = None
         self.back_window_id = None
         self.format_window_id = None
         self.convert_window_id = None
@@ -671,9 +781,17 @@ class ImageConverter:
         bottom_y = event.height - 60
         
         if self.progress_label_window:
-            self.canvas.coords(self.progress_label_window, event.width // 2, bottom_y - 60)
+            self.canvas.coords(self.progress_label_window, event.width // 2, bottom_y - 70)
         if self.progress_bar_window:
             self.canvas.coords(self.progress_bar_window, event.width // 2, bottom_y - 45)
+        if self.progress_percent_window:
+            self.canvas.coords(self.progress_percent_window, event.width // 2, bottom_y - 22)
+        
+        # Кнопка музыки всегда в левом верхнем углу
+        if self.music_window_id:
+            self.canvas.coords(self.music_window_id, 70, 30)
+        else:
+            self.music_window_id = self.canvas.create_window(70, 30, window=self.music_btn)
         
         if self.buttons_expanded:
             sp = 280
@@ -759,25 +877,48 @@ class ImageConverter:
         
         self.root.after(10, lambda: self._animate_combine(cx, cy, progress + 1, max_steps))
     
-    def _show_progress(self, text):
-        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+    def _init_progress_windows(self):
+        """Создаёт окна прогрессбара на canvas (вызывается однократно)."""
+        if self.progress_bar_window is not None:
+            return
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w < 1 or h < 1:
+            return
         by = h - 60
-        self.progress_label.configure(text=text)
-        if not self.progress_label_window:
-            self.progress_label_window = self.canvas.create_window(w // 2, by - 60, window=self.progress_label)
-        if not self.progress_bar_window:
-            self.progress_bar_window = self.canvas.create_window(w // 2, by - 45, window=self.progress_bar)
-        if self.progress_bar_id:
-            self.progress_bar.delete(self.progress_bar_id)
-        self.progress_bar_id = self.progress_bar.create_rectangle(0, 0, 100, 4, fill="#3A8BED", outline="")
+        self.progress_label_window = self.canvas.create_window(w // 2, by - 70, window=self.progress_label)
+        self.progress_bar_window = self.canvas.create_window(w // 2, by - 45, window=self.progress_bar)
+        self.progress_percent_window = self.canvas.create_window(w // 2, by - 22, window=self.progress_percent_label)
+        self.progress_bar_id = self.progress_bar.create_rectangle(0, 0, 0, 20, fill="#FF0000", outline="")
     
-    def _update_progress_bar(self, width):
+    def _show_progress(self, text):
+        self._init_progress_windows()
+        self.progress_label.configure(text=text)
+    
+    def _update_progress_bar(self, fraction):
+        """Обновляет прогрессбар. fraction от 0.0 до 1.0.
+        Цвет плавно переходит от красного (#FF0000) к рыжему (#FF8C00).
+        """
         if self.progress_bar_id:
             self.progress_bar.delete(self.progress_bar_id)
-        self.progress_bar_id = self.progress_bar.create_rectangle(0, 0, width, 4, fill="#3A8BED", outline="")
+        
+        bar_width = 400
+        fill_width = int(bar_width * fraction)
+        if fill_width < 1 and fraction > 0:
+            fill_width = 1
+        
+        # Градиент от красного (0%) к рыжему (100%)
+        color = _lerp_color("#FF0000", "#FF8C00", fraction)
+        
+        self.progress_bar_id = self.progress_bar.create_rectangle(0, 0, fill_width, 20, fill=color, outline="")
+        
+        # Обновляем процент
+        percent = int(fraction * 100)
+        self.progress_percent_label.configure(text=f"{percent}%")
     
     def _hide_progress(self):
         self.progress_label.configure(text="")
+        self.progress_percent_label.configure(text="")
         if self.progress_bar_id:
             self.progress_bar.delete(self.progress_bar_id)
             self.progress_bar_id = None
@@ -787,9 +928,24 @@ class ImageConverter:
         if self.progress_bar_window:
             self.canvas.delete(self.progress_bar_window)
             self.progress_bar_window = None
+        if self.progress_percent_window:
+            self.canvas.delete(self.progress_percent_window)
+            self.progress_percent_window = None
     
-    def _generate_random_name(self, length=8):
-        return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length))
+    def _get_unique_output_path(self, base_name, output_dir, ext):
+        """Генерирует уникальный путь к файлу на основе оригинального имени.
+        Если файл с таким именем уже существует, добавляет числовой суффикс.
+        """
+        out_path = os.path.join(output_dir, f"{base_name}{ext}")
+        if not os.path.exists(out_path):
+            return out_path
+        
+        counter = 1
+        while True:
+            out_path = os.path.join(output_dir, f"{base_name}_{counter}{ext}")
+            if not os.path.exists(out_path):
+                return out_path
+            counter += 1
     
     def _convert_single_image(self, path, output_dir, fmt):
         ext = os.path.splitext(path)[1].lower()
@@ -799,6 +955,11 @@ class ImageConverter:
             img = Image.fromarray(raw.postprocess())
         elif ext in self.raw_extensions:
             return None, "rawpy не установлен для RAW"
+        elif ext in self.heic_extensions and pillow_heif is not None:
+            heif_file = pillow_heif.open_heif(path)
+            img = Image.frombytes(heif_file.mode, heif_file.size, heif_file.data)
+        elif ext in self.heic_extensions:
+            return None, "pillow_heif не установлен для HEIC/HEIF"
         else:
             img = Image.open(path)
         
@@ -819,14 +980,15 @@ class ImageConverter:
         if fmt == "PNG":
             kwargs["optimize"] = True
         
-        save_fmt = "JPEG" if fmt == "JPG" else fmt
-        ext = self.format_extensions[fmt]
+        if fmt == "HEIC" and pillow_heif is None:
+            return None, "pillow_heif не установлен для сохранения в HEIC"
         
-        while True:
-            name = self._generate_random_name()
-            out = os.path.join(output_dir, f"{name}{ext}")
-            if not os.path.exists(out):
-                break
+        save_fmt = "JPEG" if fmt == "JPG" else fmt
+        out_ext = self.format_extensions[fmt]
+        
+        # Используем оригинальное имя файла (без расширения)
+        base_name = os.path.splitext(os.path.basename(path))[0]
+        out = self._get_unique_output_path(base_name, output_dir, out_ext)
         
         img.save(out, save_fmt, **kwargs)
         return out, None
@@ -862,7 +1024,7 @@ class ImageConverter:
                     break
                 
                 name = os.path.basename(path)
-                self.root.after(0, lambda t=f"[{i+1}/{total}] Конвертация {name} -> {fmt}": self._show_progress(t))
+                self.root.after(0, lambda n=name, idx=i, ttl=total, f=fmt: self._show_progress(f"[{idx+1}/{ttl}] Конвертация {n} -> {f}"))
                 
                 _, err = self._convert_single_image(path, out_dir, fmt)
                 if err:
@@ -870,7 +1032,8 @@ class ImageConverter:
                 else:
                     success += 1
                 
-                self.root.after(0, lambda w=int(200 * (i + 1) / total): self._update_progress_bar(w))
+                fraction = (i + 1) / total
+                self.root.after(0, lambda f=fraction: self._update_progress_bar(f))
             
             if errors:
                 msg = "\n".join(errors[:5])
@@ -963,6 +1126,47 @@ class ImageConverter:
         
         animate()
         win.after(5000, lambda: [frames.clear(), win.destroy() if win.winfo_exists() else None])
+    
+    def _init_music(self):
+        """Инициализирует фоновую музыку (зацикленно)."""
+        if vlc is None:
+            return
+        try:
+            mp3_path = resource_path("dark_hourDEMONDICE.mp3")
+            if not os.path.exists(mp3_path):
+                print("⚠️ Файл dark_hourDEMONDICE.mp3 не найден")
+                return
+            self.music_player = vlc.MediaPlayer(mp3_path)
+            
+            # Зацикливание через событие окончания
+            events = self.music_player.event_manager()
+            events.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_music_end)
+            
+            self.music_player.play()
+            self.music_playing = True
+        except Exception as e:
+            print(f"⚠️ Ошибка инициализации музыки: {e}")
+    
+    def _on_music_end(self, event):
+        """Перезапускает трек при окончании."""
+        if self.music_player and self.music_playing:
+            self.music_player.stop()
+            self.music_player.play()
+    
+    def _toggle_music(self):
+        """Включает/выключает музыку."""
+        if self.music_player is None:
+            return
+        if self.music_playing:
+            self.music_player.pause()
+            self.music_playing = False
+            self.music_btn._text = "♫ ВЫКЛ"
+            self.music_btn.set_disabled(True)
+        else:
+            self.music_player.play()
+            self.music_playing = True
+            self.music_btn._text = "♫ ВКЛ"
+            self.music_btn.set_disabled(False)
     
     def run(self):
         self.root.mainloop()
